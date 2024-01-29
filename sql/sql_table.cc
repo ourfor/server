@@ -10175,11 +10175,12 @@ bool mysql_alter_table(THD *thd, const LEX_CSTRING *new_db,
   TABLE *table, *new_table= nullptr;
   DDL_LOG_STATE ddl_log_state;
   Turn_errors_to_warnings_handler errors_to_warnings;
-
+  HA_CHECK_OPT check_opt;
 #ifdef WITH_PARTITION_STORAGE_ENGINE
   bool partition_changed= false;
   bool fast_alter_partition= false;
 #endif
+  bool require_copy_algorithm;
   bool partial_alter= false;
   /*
     start_alter_id is the gtid seq no of the START Alter - the 1st part
@@ -10869,18 +10870,54 @@ do_continue:;
 #endif /* WITH_WSREP */
 
   /*
+    ALTER TABLE ... ENGINE to the same engine is a common way to
+    request table rebuild. Set ALTER_RECREATE flag to force table
+    rebuild.
+  */
+  if (new_db_type == old_db_type)
+  {
+    if (create_info->used_fields & HA_CREATE_USED_ENGINE)
+      alter_info->flags|= ALTER_RECREATE;
+
+    /*
+      Check if we are using ALTER TABLE FORCE without any other options
+      (except ENGINE == current_engine).
+      In this case we will try to recreate an identical to the original.
+      This code is also used with REPAIR and OPTIMIZE.
+    */
+    if (alter_info->flags == ALTER_RECREATE &&
+        ((create_info->used_fields & ~HA_CREATE_USED_ENGINE) == 0))
+      create_info->recreate_identical_table= 1;
+  }
+
+  /*
     We can use only copy algorithm if one of the following is true:
+    - If the table is from an old MariaDB version and requires data
+      modifications. In this case we ignore --alter-algorithm as
+      as we cannot use any other algorithm than COPY (using other
+      algorithms could open up the problem that the table .frm version
+      is updated without data transformations and the table would be
+      corrupted without any way for MariaDB to notice this during
+      check/upgrade).
+      This logic ensurses that ALTER TABLE ... FORCE (no other
+      options) will always be be able to repair an table.
     - In-place is impossible for given operation.
     - Changes to partitioning which were not handled by fast_alter_part_table()
       needs to be handled using table copying algorithm unless the engine
       supports auto-partitioning as such engines can do some changes
       using in-place API.
   */
-  if (is_inplace_alter_impossible(table, create_info, alter_info)
-      || IF_PARTITIONING((partition_changed &&
-                          !(old_db_type->partition_flags() & HA_USE_AUTO_PARTITION)), 0))
+  check_opt.init();
+
+  require_copy_algorithm= (table->file->ha_check_for_upgrade(&check_opt) ==
+                           HA_ADMIN_NEEDS_DATA_CONVERSION);
+  if (require_copy_algorithm ||
+      is_inplace_alter_impossible(table, create_info, alter_info) ||
+      IF_PARTITIONING((partition_changed &&
+                       !(old_db_type->partition_flags() & HA_USE_AUTO_PARTITION)), 0))
   {
-    if (alter_info->algorithm_is_nocopy(thd))
+    if (alter_info->algorithm_is_nocopy(thd) &&
+        !(require_copy_algorithm && alter_info->algorithm_not_specified()))
     {
       my_error(ER_ALTER_OPERATION_NOT_SUPPORTED, MYF(0),
                alter_info->algorithm_clause(thd), "ALGORITHM=COPY");
@@ -10889,15 +10926,6 @@ do_continue:;
 
     alter_info->set_requested_algorithm(Alter_info::ALTER_TABLE_ALGORITHM_COPY);
   }
-
-  /*
-    ALTER TABLE ... ENGINE to the same engine is a common way to
-    request table rebuild. Set ALTER_RECREATE flag to force table
-    rebuild.
-  */
-  if (new_db_type == old_db_type &&
-      create_info->used_fields & HA_CREATE_USED_ENGINE)
-    alter_info->flags|= ALTER_RECREATE;
 
   /*
     Handling of symlinked tables:
@@ -12426,6 +12454,7 @@ copy_data_between_tables(THD *thd, TABLE *from, TABLE *to,
     mysql_recreate_table()
     thd			Thread handler
     table_list          Table to recreate
+    partition_admin     Optimizing partitions
     table_copy          Recreate the table by using
                         ALTER TABLE COPY algorithm
 
@@ -12434,7 +12463,8 @@ copy_data_between_tables(THD *thd, TABLE *from, TABLE *to,
 */
 
 bool mysql_recreate_table(THD *thd, TABLE_LIST *table_list,
-                          Recreate_info *recreate_info, bool table_copy)
+                          Recreate_info *recreate_info,
+                          bool partition_admin, bool table_copy)
 {
   Table_specification_st create_info;
   Alter_info alter_info;
@@ -12451,10 +12481,14 @@ bool mysql_recreate_table(THD *thd, TABLE_LIST *table_list,
   create_info.init();
   create_info.row_type=ROW_TYPE_NOT_USED;
   create_info.alter_info= &alter_info;
+  create_info.recreate_identical_table= 1;
   /* Force alter table to recreate table */
   alter_info.flags= (ALTER_CHANGE_COLUMN | ALTER_RECREATE);
+  alter_info.partition_flags= thd->lex->alter_info.partition_flags;
+  if (partition_admin)
+    alter_info.partition_flags= ALTER_PARTITION_ADMIN;
 
-  if (table_copy)
+  if (table_copy && !partition_admin)
     alter_info.set_requested_algorithm(
       Alter_info::ALTER_TABLE_ALGORITHM_COPY);
 
@@ -12785,7 +12819,7 @@ bool Sql_cmd_create_table_like::execute(THD *thd)
 
   /*
    Since CREATE_INFO is not full without Alter_info, it is better to pass them
-   as a signle parameter. TODO: remove alter_info argument where create_info is
+   as a single parameter. TODO: remove alter_info argument where create_info is
    passed.
   */
   create_info.alter_info= &alter_info;
