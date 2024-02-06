@@ -2213,6 +2213,51 @@ fts_trx_row_get_new_state(
 }
 
 /******************************************************************//**
+Compare two fts_trx_table_t instances.
+@return < 0 if n1 < n2, 0 if n1 == n2, > 0 if n1 > n2 */
+static
+int
+fts_trx_table_cmp(
+/*==============*/
+	const void*	p1,			/*!< in: id1 */
+	const void*	p2)			/*!< in: id2 */
+{
+	const dict_table_t*	table1
+		= (*static_cast<const fts_trx_table_t* const*>(p1))->table;
+
+	const dict_table_t*	table2
+		= (*static_cast<const fts_trx_table_t* const*>(p2))->table;
+
+	return((table1->id > table2->id)
+	       ? 1
+	       : (table1->id == table2->id)
+		  ? 0
+		  : -1);
+}
+
+/******************************************************************//**
+Compare a table id with a fts_trx_table_t table id.
+@return < 0 if n1 < n2, 0 if n1 == n2,> 0 if n1 > n2 */
+static
+int
+fts_trx_table_id_cmp(
+/*=================*/
+	const void*	p1,			/*!< in: id1 */
+	const void*	p2)			/*!< in: id2 */
+{
+	const uintmax_t*	table_id = static_cast<const uintmax_t*>(p1);
+	const dict_table_t*	table2
+		= (*static_cast<const fts_trx_table_t* const*>(p2))->table;
+
+	return((*table_id > table2->id)
+	       ? 1
+	       : (*table_id == table2->id)
+		  ? 0
+		  : -1);
+}
+
+
+/******************************************************************//**
 Create a savepoint instance.
 @return savepoint instance */
 static
@@ -2283,6 +2328,19 @@ fts_trx_create(
 	return(ftt);
 }
 
+/** Compare two doc_id */
+static inline int doc_id_cmp(doc_id_t a, doc_id_t b)
+{
+  return b > a ? -1 : a > b;
+}
+
+/** Compare two DOC_ID. */
+int fts_doc_id_cmp(const void *p1, const void *p2)
+{
+  return doc_id_cmp(*static_cast<const doc_id_t*>(p1),
+                    *static_cast<const doc_id_t*>(p2));
+}
+
 /******************************************************************//**
 Create an FTS trx table.
 @return FTS trx table */
@@ -2301,7 +2359,8 @@ fts_trx_table_create(
 	ftt->table = table;
 	ftt->fts_trx = fts_trx;
 
-	ftt->rows = rbt_create(sizeof(fts_trx_row_t), fts_trx_row_doc_id_cmp);
+	static_assert(!offsetof(fts_trx_row_t, doc_id), "ABI");
+	ftt->rows = rbt_create(sizeof(fts_trx_row_t), fts_doc_id_cmp);
 
 	return(ftt);
 }
@@ -2325,7 +2384,8 @@ fts_trx_table_clone(
 	ftt->table = ftt_src->table;
 	ftt->fts_trx = ftt_src->fts_trx;
 
-	ftt->rows = rbt_create(sizeof(fts_trx_row_t), fts_trx_row_doc_id_cmp);
+	static_assert(!offsetof(fts_trx_row_t, doc_id), "ABI");
+	ftt->rows = rbt_create(sizeof(fts_trx_row_t), fts_doc_id_cmp);
 
 	/* Copy the rb tree values to the new savepoint. */
 	rbt_merge_uniq(ftt->rows, ftt_src->rows);
